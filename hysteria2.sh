@@ -1,8 +1,7 @@
 cat > hysteria2.sh <<'EOF'
 #!/usr/bin/env bash
 #==========================================================================
-#  Hysteria 2 一键自动安装脚本 (优化 OpenRC 崩溃日志)
-#  支持: Debian/Ubuntu, CentOS/RHEL/Rocky/Alma, Alpine, OpenWrt 等
+#  Hysteria 2 一键自动安装脚本 (终极 Alpine LXC 兼容版)
 #==========================================================================
 set -e
 
@@ -67,7 +66,7 @@ gen_pass() {
     else cat /dev/urandom | tr -dc '0-9a-f' | fold -w 24 | head -n 1; fi
 }
 
-# ----- 依赖安装 (自动匹配各系统包名) -----
+# ----- 依赖安装 -----
 install_deps() {
     local CMD_MISSING=""
     ! command -v curl >/dev/null 2>&1 && CMD_MISSING+="curl "
@@ -147,9 +146,10 @@ configure_firewall() {
     fi
 }
 
-# ----- 服务安装 (针对容器极端优化: 带自检 + GOMEMLIMIT 软限制) -----
+# ----- [终极修复版] 服务安装 (强制规避 Alpine 冲突) -----
 install_service() {
-    if command -v systemctl &>/dev/null; then
+    # 【核心修正】：如果是 Alpine 系统，即便 systemctl 相关检查误触，也会直接短路跳过！
+    if [ "$OS" != "alpine" ] && command -v systemctl &>/dev/null; then
         cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
 Description=Hysteria 2 Server
@@ -175,7 +175,7 @@ EOF
             exit 1
         fi
     elif command -v rc-service &>/dev/null || [ "$OS" = "alpine" ]; then
-        echo -e "${YELLOW}检测到 OpenRC/容器环境，使用 nohup 进程守护启动并启用 GOMEMLIMIT 软限制...${NC}"
+        echo -e "${YELLOW}检测到 OpenRC/Alpine 容器环境，使用 nohup 进程守护启动...${NC}"
         pkill -f "hysteria server" 2>/dev/null || true
         > /var/log/hysteria.log 2>/dev/null || touch /var/log/hysteria.log
         
@@ -187,7 +187,7 @@ EOF
             echo "$PRE_CHECK"
             echo -e "${YELLOW}------------------------------------------------------${NC}"
             echo -e "提示：如果提示 'permission denied'，请给 Docker/LXC 容器添加 --privileged 参数。"
-            echo -e "提示：如果提示 'cannot allocate memory'，说明 64MB 确实跑不动，请尝试加内存到 128MB。"
+            echo -e "提示：如果提示 'cannot allocate memory'，说明 64MB 跑不动，请尝试加到 128MB 内存。"
             exit 1
         fi
         
