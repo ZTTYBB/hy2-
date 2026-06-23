@@ -1,3 +1,4 @@
+cat > hysteria2.sh <<'EOF'
 #!/usr/bin/env bash
 #==========================================================================
 #  Hysteria 2 一键自动安装脚本 (优化 OpenRC 崩溃日志)
@@ -146,7 +147,7 @@ configure_firewall() {
     fi
 }
 
-# ----- [优化核心] 服务安装 (带日志输出与崩溃诊断) -----
+# ----- 服务安装 (针对容器极端优化: 带自检 + GOMEMLIMIT 软限制) -----
 install_service() {
     if command -v systemctl &>/dev/null; then
         cat > /etc/systemd/system/hysteria-server.service <<EOF
@@ -159,8 +160,6 @@ ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536
-# 注意：64MB 机器跑 Hysteria 需要借用 Swap，移除死板的 MemoryMax 限制
-# MemoryMax=40M
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -175,39 +174,41 @@ EOF
             journalctl -u hysteria-server -n 20 --no-pager
             exit 1
         fi
-    elif command -v rc-service &>/dev/null; then
-        # 极低内存环境中，禁止栈溢出并绑定日志输出
-        cat > /etc/init.d/hysteria-server <<'EOF'
-#!/sbin/openrc-run
-description="Hysteria 2 Server"
-command="/usr/local/bin/hysteria"
-command_args="server -c /etc/hysteria/config.yaml"
-command_background=true
-command_user="root"
-pidfile="/run/hysteria.pid"
-output_log="/var/log/hysteria.log"
-error_log="/var/log/hysteria.log"
-
-start_pre() {
-    # 解除默认 8MB 的栈空间限制（防止 64MB 机器运行崩溃）
-    ulimit -s unlimited 2>/dev/null || true
-    ulimit -n 65536 2>/dev/null || true
-}
-EOF
-        chmod +x /etc/init.d/hysteria-server
-        rc-update add hysteria-server default >/dev/null 2>&1
-        rc-service hysteria-server start >/dev/null 2>&1
+    elif command -v rc-service &>/dev/null || [ "$OS" = "alpine" ]; then
+        echo -e "${YELLOW}检测到 OpenRC/容器环境，使用 nohup 进程守护启动并启用 GOMEMLIMIT 软限制...${NC}"
+        pkill -f "hysteria server" 2>/dev/null || true
+        > /var/log/hysteria.log 2>/dev/null || touch /var/log/hysteria.log
         
-        sleep 3
-        # 检查状态
-        if rc-service hysteria-server status | grep -q "started"; then
-            echo -e "${GREEN}OpenRC 服务已运行${NC}"
+        echo -e "${BLUE}正在执行启动前健康自检 (2秒)...${NC}"
+        PRE_CHECK=$(timeout 2s /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml 2>&1 || true)
+        if echo "$PRE_CHECK" | grep -qE "(panic|fatal|Error|permission denied|cannot allocate)"; then
+            echo -e "${RED}【前置检查发现致命报错】${NC}"
+            echo -e "${YELLOW}------------------------------------------------------${NC}"
+            echo "$PRE_CHECK"
+            echo -e "${YELLOW}------------------------------------------------------${NC}"
+            echo -e "提示：如果提示 'permission denied'，请给 Docker/LXC 容器添加 --privileged 参数。"
+            echo -e "提示：如果提示 'cannot allocate memory'，说明 64MB 确实跑不动，请尝试加内存到 128MB。"
+            exit 1
+        fi
+        
+        echo -e "${BLUE}正式启动服务...${NC}"
+        nohup bash -c "ulimit -s unlimited 2>/dev/null; export GOMEMLIMIT=48MiB; /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml" >> /var/log/hysteria.log 2>&1 &
+        sleep 4
+        
+        if pgrep -f "hysteria server" > /dev/null; then
+            echo -e "${GREEN}Hysteria 2 服务已通过 nohup 在后台成功运行！${NC}"
+            echo -e "${YELLOW}注意：容器重启后需再次运行本脚本启动。${NC}"
         else
-            echo -e "${RED}OpenRC 启动失败！${NC}"
-            echo -e "${YELLOW}=== 自动提取错误日志 (最近20行) ===${NC}"
-            tail -n 20 /var/log/hysteria.log 2>/dev/null || echo "未生成日志文件，请尝试手动运行:"
-            echo -e "${YELLOW}===================================${NC}"
-            echo -e "如果上面的日志显示端口被占用，请使用命令: \n  lsof -i:${PORT} \n找到占用进程并杀掉。"
+            echo -e "${RED}服务启动失败！抓取最终错误日志...${NC}"
+            echo -e "${YELLOW}================================================${NC}"
+            if [ -s /var/log/hysteria.log ]; then
+                tail -n 30 /var/log/hysteria.log
+            else
+                echo -e "${RED}日志依然为空！可能是遭遇了极其严厉的 OOM 强杀。${NC}"
+                echo -e "${YELLOW}请手动在终端执行以下命令查看最终爆出的错误：${NC}"
+                echo "  /usr/local/bin/hysteria server -c /etc/hysteria/config.yaml"
+            fi
+            echo -e "${YELLOW}================================================${NC}"
             exit 1
         fi
     else
@@ -304,3 +305,7 @@ EOF
 }
 
 main
+EOF
+
+# 赋予执行权限
+chmod +x hysteria2.sh
