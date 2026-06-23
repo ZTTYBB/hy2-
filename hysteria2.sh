@@ -1,12 +1,7 @@
 #!/usr/bin/env bash
 #==========================================================================
-#  Hysteria 2 一键自动安装脚本 (超轻量，适配 64MB，全自动)
+#  Hysteria 2 一键自动安装脚本 (优化 OpenRC 崩溃日志)
 #  支持: Debian/Ubuntu, CentOS/RHEL/Rocky/Alma, Alpine, OpenWrt 等
-#  默认: 随机端口+随机密码，自动选择最优伪装域名，无交互
-#  可通过环境变量自定义:
-#    HY2_PORT       监听端口
-#    HY2_PASSWORD   认证密码
-#    HY2_DOMAIN     伪装域名 (若留空则自动测试选择)
 #==========================================================================
 set -e
 
@@ -71,48 +66,39 @@ gen_pass() {
     else cat /dev/urandom | tr -dc '0-9a-f' | fold -w 24 | head -n 1; fi
 }
 
-# ----- [修改重点] 最小依赖安装 -----
+# ----- 依赖安装 (自动匹配各系统包名) -----
 install_deps() {
-    # 逐个检查命令是否存在，单独记录缺失列表 (仅用于提示，不再用于直接当做包名安装)
     local CMD_MISSING=""
     ! command -v curl >/dev/null 2>&1 && CMD_MISSING+="curl "
     ! command -v openssl >/dev/null 2>&1 && CMD_MISSING+="openssl "
     ! command -v tar >/dev/null 2>&1 && CMD_MISSING+="tar "
     ! command -v ss >/dev/null 2>&1 && CMD_MISSING+="ss(iproute2) "
-
-    # 如果没有缺失任何依赖，直接返回
     [ -z "$CMD_MISSING" ] && return
     
     echo -e "${YELLOW}检测到缺失依赖: $CMD_MISSING，正在根据 $OS 系统自动安装...${NC}"
-
-    # 根据操作系统映射不同的依赖包名称
     case $OS in
         ubuntu|debian)
-            # Debian/Ubuntu 中 ss 命令属于 iproute2
             apt-get update -qq
             apt-get install --no-install-recommends -y -qq curl openssl tar iproute2 >/dev/null
             ;;
         centos|rhel|rocky|almalinux|fedora)
-            # RedHat 系中 ss 命令属于 iproute
             yum install -y -q curl openssl tar iproute 2>/dev/null || dnf install -y -q curl openssl tar iproute >/dev/null
             ;;
         alpine)
-            # Alpine 中 ss 命令属于 iproute2
             apk add --no-cache curl openssl tar iproute2 >/dev/null
             ;;
         openwrt)
-            # OpenWrt 中 openssl 包名为 openssl-util
             opkg update >/dev/null 2>&1
             opkg install curl openssl-util tar iproute2 >/dev/null 2>&1
             ;;
         *)
-            echo -e "${RED}未能自动识别此系统的包管理器，请手动安装以下依赖: $CMD_MISSING${NC}"
+            echo -e "${RED}未能自动识别包管理器，请手动安装: $CMD_MISSING${NC}"
             exit 1
             ;;
     esac
 }
 
-# ----- 下载 Hysteria 2 (自动选择 musl/glibc) -----
+# ----- 下载 Hysteria 2 -----
 download_hysteria() {
     local arch=$(uname -m)
     case $arch in
@@ -122,13 +108,11 @@ download_hysteria() {
         *) echo -e "${RED}不支持的架构: $arch${NC}"; exit 1 ;;
     esac
 
-    # 检测 musl libc
     local LIBC=""
     if ldd /bin/sh 2>/dev/null | grep -qi musl || [ "$OS" = "alpine" ]; then
         LIBC="-musl"
     fi
 
-    # 获取最新版本
     LATEST=$(curl -s --connect-timeout 10 https://api.github.com/repos/apernet/hysteria/releases/latest | awk -F'"' '/"tag_name":/ {print $4}')
     [ -z "$LATEST" ] && LATEST="v2.4.0"
     echo -e "${GREEN}安装 Hysteria ${LATEST}${NC}"
@@ -147,7 +131,7 @@ generate_cert() {
     chmod 644 /etc/hysteria/hysteria.crt
 }
 
-# ----- 防火墙 (仅提示) -----
+# ----- 防火墙 -----
 configure_firewall() {
     local p=$1
     if command -v ufw &>/dev/null; then
@@ -162,7 +146,7 @@ configure_firewall() {
     fi
 }
 
-# ----- 服务安装 (systemd / OpenRC) -----
+# ----- [优化核心] 服务安装 (带日志输出与崩溃诊断) -----
 install_service() {
     if command -v systemctl &>/dev/null; then
         cat > /etc/systemd/system/hysteria-server.service <<EOF
@@ -175,36 +159,56 @@ ExecStart=/usr/local/bin/hysteria server -c /etc/hysteria/config.yaml
 Restart=on-failure
 RestartSec=10
 LimitNOFILE=65536
-MemoryMax=40M
+# 注意：64MB 机器跑 Hysteria 需要借用 Swap，移除死板的 MemoryMax 限制
+# MemoryMax=40M
 [Install]
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
         systemctl enable hysteria-server >/dev/null 2>&1
         systemctl restart hysteria-server
-        sleep 2
+        sleep 3
         if systemctl is-active --quiet hysteria-server; then
             echo -e "${GREEN}systemd 服务已运行${NC}"
         else
-            echo -e "${RED}启动失败，日志: journalctl -u hysteria-server${NC}"; exit 1
+            echo -e "${RED}启动失败！查看具体原因: journalctl -u hysteria-server -n 20 --no-pager${NC}"
+            journalctl -u hysteria-server -n 20 --no-pager
+            exit 1
         fi
     elif command -v rc-service &>/dev/null; then
+        # 极低内存环境中，禁止栈溢出并绑定日志输出
         cat > /etc/init.d/hysteria-server <<'EOF'
 #!/sbin/openrc-run
 description="Hysteria 2 Server"
 command="/usr/local/bin/hysteria"
 command_args="server -c /etc/hysteria/config.yaml"
 command_background=true
+command_user="root"
 pidfile="/run/hysteria.pid"
+output_log="/var/log/hysteria.log"
+error_log="/var/log/hysteria.log"
+
+start_pre() {
+    # 解除默认 8MB 的栈空间限制（防止 64MB 机器运行崩溃）
+    ulimit -s unlimited 2>/dev/null || true
+    ulimit -n 65536 2>/dev/null || true
+}
 EOF
         chmod +x /etc/init.d/hysteria-server
         rc-update add hysteria-server default >/dev/null 2>&1
         rc-service hysteria-server start >/dev/null 2>&1
-        sleep 2
-        if rc-service hysteria-server status | grep -q started; then
+        
+        sleep 3
+        # 检查状态
+        if rc-service hysteria-server status | grep -q "started"; then
             echo -e "${GREEN}OpenRC 服务已运行${NC}"
         else
-            echo -e "${RED}OpenRC 启动失败${NC}"; exit 1
+            echo -e "${RED}OpenRC 启动失败！${NC}"
+            echo -e "${YELLOW}=== 自动提取错误日志 (最近20行) ===${NC}"
+            tail -n 20 /var/log/hysteria.log 2>/dev/null || echo "未生成日志文件，请尝试手动运行:"
+            echo -e "${YELLOW}===================================${NC}"
+            echo -e "如果上面的日志显示端口被占用，请使用命令: \n  lsof -i:${PORT} \n找到占用进程并杀掉。"
+            exit 1
         fi
     else
         echo -e "${YELLOW}未找到 systemd/OpenRC，请手动启动: hysteria server -c /etc/hysteria/config.yaml &${NC}"
@@ -213,11 +217,10 @@ EOF
 
 # ----- 主流程 -----
 main() {
-    # 1. 必须先安装依赖
     install_deps
     download_hysteria
 
-    # 2. 伪装域名自动选择 (可通过 HY2_DOMAIN 覆盖)
+    # 1. 伪装域名自动选择
     if [ -n "$HY2_DOMAIN" ]; then
         BEST_DOMAIN="$HY2_DOMAIN"
     else
@@ -230,26 +233,23 @@ main() {
             echo -e "  ${d} : ${lat} ms"
             [ "$lat" -lt "$BEST_TIME" ] && { BEST_TIME=$lat; BEST_DOMAIN=$d; }
         done
-        if [ "$BEST_TIME" -ge 5000 ]; then
-            echo -e "${YELLOW}所有预设域名不通，使用默认 www.bing.com${NC}"
-            BEST_DOMAIN="www.bing.com"
-        fi
+        [ "$BEST_TIME" -ge 5000 ] && BEST_DOMAIN="www.bing.com"
     fi
     echo -e "${GREEN}伪装域名: ${BEST_DOMAIN}${NC}"
 
-    # 3. 端口与密码 (环境变量优先，否则随机)
+    # 2. 端口与密码
     PORT=${HY2_PORT:-$(shuf -i 10000-65000 -n 1)}
     PASSWORD=${HY2_PASSWORD:-$(gen_pass)}
     echo -e "${GREEN}端口: ${PORT}  密码: ${PASSWORD}${NC}"
 
-    # 端口占用检查 (注意：现在 ss 命令已经可以正常使用了)
+    # 端口占用检查
     if command -v ss &>/dev/null; then
         ss -uln | grep -q ":${PORT} " && { echo -e "${RED}端口 ${PORT} 被占用${NC}"; exit 1; }
     fi
 
     generate_cert
 
-    # 4. 动态调整 QUIC 窗口 (节约内存)
+    # 3. 动态调整 QUIC 窗口
     if [ "$MEM_MB" -le 64 ]; then
         SWIN=524288; CWIN=2097152
     elif [ "$MEM_MB" -le 128 ]; then
@@ -262,21 +262,17 @@ main() {
 
     cat > /etc/hysteria/config.yaml <<EOF
 listen: :$PORT
-
 tls:
   cert: /etc/hysteria/hysteria.crt
   key: /etc/hysteria/hysteria.key
-
 auth:
   type: password
   password: "$PASSWORD"
-
 masquerade:
   type: proxy
   proxy:
     url: https://${BEST_DOMAIN}
     rewriteHost: true
-
 quic:
   initStreamReceiveWindow: $SWIN
   maxStreamReceiveWindow: $SWIN
@@ -289,7 +285,6 @@ EOF
     install_service
     configure_firewall $PORT
 
-    # 公网 IP
     LOCAL_IP=$(curl -s --connect-timeout 5 https://api.ipify.org || curl -s --connect-timeout 5 https://ifconfig.me || echo "未知")
     SHARE_LINK="hysteria2://$(urlencode "$PASSWORD")@${LOCAL_IP}:${PORT}?sni=${BEST_DOMAIN}&insecure=1#Hysteria2-${LOCAL_IP}"
 
@@ -300,7 +295,6 @@ EOF
     echo -e " 端口:        ${PORT}"
     echo -e " 密码:        ${PASSWORD}"
     echo -e " 伪装域名:    ${BEST_DOMAIN}"
-    echo -e " 协议:        UDP, 跳过证书验证"
     echo -e "${BLUE}----------------------------------------${NC}"
     echo -e " 分享链接:"
     echo -e " ${GREEN}${SHARE_LINK}${NC}"
