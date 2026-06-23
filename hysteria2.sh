@@ -71,20 +71,44 @@ gen_pass() {
     else cat /dev/urandom | tr -dc '0-9a-f' | fold -w 24 | head -n 1; fi
 }
 
-# ----- 最小依赖安装 -----
+# ----- [修改重点] 最小依赖安装 -----
 install_deps() {
-    local miss=""
-    for cmd in curl openssl tar ss; do
-        command -v $cmd >/dev/null 2>&1 || miss+="$cmd "
-    done
-    [ -z "$miss" ] && return
-    echo -e "${YELLOW}安装依赖: $miss${NC}"
+    # 逐个检查命令是否存在，单独记录缺失列表 (仅用于提示，不再用于直接当做包名安装)
+    local CMD_MISSING=""
+    ! command -v curl >/dev/null 2>&1 && CMD_MISSING+="curl "
+    ! command -v openssl >/dev/null 2>&1 && CMD_MISSING+="openssl "
+    ! command -v tar >/dev/null 2>&1 && CMD_MISSING+="tar "
+    ! command -v ss >/dev/null 2>&1 && CMD_MISSING+="ss(iproute2) "
+
+    # 如果没有缺失任何依赖，直接返回
+    [ -z "$CMD_MISSING" ] && return
+    
+    echo -e "${YELLOW}检测到缺失依赖: $CMD_MISSING，正在根据 $OS 系统自动安装...${NC}"
+
+    # 根据操作系统映射不同的依赖包名称
     case $OS in
-        ubuntu|debian) apt-get update -qq; apt-get install --no-install-recommends -y -qq $miss >/dev/null ;;
-        centos|rhel|rocky|almalinux|fedora) yum install -y -q $miss 2>/dev/null || dnf install -y -q $miss >/dev/null ;;
-        alpine) apk add --no-cache $miss >/dev/null ;;
-        openwrt) opkg update >/dev/null 2>&1; opkg install $miss >/dev/null 2>&1 ;;
-        *) echo -e "${RED}未知包管理器，请手动安装: $miss${NC}"; exit 1 ;;
+        ubuntu|debian)
+            # Debian/Ubuntu 中 ss 命令属于 iproute2
+            apt-get update -qq
+            apt-get install --no-install-recommends -y -qq curl openssl tar iproute2 >/dev/null
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            # RedHat 系中 ss 命令属于 iproute
+            yum install -y -q curl openssl tar iproute 2>/dev/null || dnf install -y -q curl openssl tar iproute >/dev/null
+            ;;
+        alpine)
+            # Alpine 中 ss 命令属于 iproute2
+            apk add --no-cache curl openssl tar iproute2 >/dev/null
+            ;;
+        openwrt)
+            # OpenWrt 中 openssl 包名为 openssl-util
+            opkg update >/dev/null 2>&1
+            opkg install curl openssl-util tar iproute2 >/dev/null 2>&1
+            ;;
+        *)
+            echo -e "${RED}未能自动识别此系统的包管理器，请手动安装以下依赖: $CMD_MISSING${NC}"
+            exit 1
+            ;;
     esac
 }
 
@@ -189,10 +213,11 @@ EOF
 
 # ----- 主流程 -----
 main() {
+    # 1. 必须先安装依赖
     install_deps
     download_hysteria
 
-    # 1. 伪装域名自动选择 (可通过 HY2_DOMAIN 覆盖)
+    # 2. 伪装域名自动选择 (可通过 HY2_DOMAIN 覆盖)
     if [ -n "$HY2_DOMAIN" ]; then
         BEST_DOMAIN="$HY2_DOMAIN"
     else
@@ -212,19 +237,19 @@ main() {
     fi
     echo -e "${GREEN}伪装域名: ${BEST_DOMAIN}${NC}"
 
-    # 2. 端口与密码 (环境变量优先，否则随机)
+    # 3. 端口与密码 (环境变量优先，否则随机)
     PORT=${HY2_PORT:-$(shuf -i 10000-65000 -n 1)}
     PASSWORD=${HY2_PASSWORD:-$(gen_pass)}
     echo -e "${GREEN}端口: ${PORT}  密码: ${PASSWORD}${NC}"
 
-    # 端口占用检查
+    # 端口占用检查 (注意：现在 ss 命令已经可以正常使用了)
     if command -v ss &>/dev/null; then
         ss -uln | grep -q ":${PORT} " && { echo -e "${RED}端口 ${PORT} 被占用${NC}"; exit 1; }
     fi
 
     generate_cert
 
-    # 3. 动态调整 QUIC 窗口 (节约内存)
+    # 4. 动态调整 QUIC 窗口 (节约内存)
     if [ "$MEM_MB" -le 64 ]; then
         SWIN=524288; CWIN=2097152
     elif [ "$MEM_MB" -le 128 ]; then
