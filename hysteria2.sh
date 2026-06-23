@@ -1,4 +1,3 @@
-cat > hysteria2.sh <<'EOF'
 #!/usr/bin/env bash
 #==========================================================================
 #  Hysteria 2 一键自动安装脚本 (终极 Alpine LXC 兼容版)
@@ -148,7 +147,6 @@ configure_firewall() {
 
 # ----- [终极修复版] 服务安装 (强制规避 Alpine 冲突) -----
 install_service() {
-    # 【核心修正】：如果是 Alpine 系统，即便 systemctl 相关检查误触，也会直接短路跳过！
     if [ "$OS" != "alpine" ] && command -v systemctl &>/dev/null; then
         cat > /etc/systemd/system/hysteria-server.service <<EOF
 [Unit]
@@ -305,7 +303,3 @@ EOF
 }
 
 main
-EOF
-
-# 赋予执行权限
-chmod +x hysteria2.sh
